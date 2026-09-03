@@ -1,0 +1,133 @@
+name: Build cgroupv2_freeze KPM (full pipeline)
+
+# ============================================================
+# 完整编译流水线：拉源码 → 装工具链 → (可选打补丁) → 编译 → 校验 → 出产物
+# 适用：lzghzr/APatch_kpm 的 fork 仓库
+#
+# 触发方式：
+#   1. 手动（推荐新手用）：仓库 Actions 页 → 本工作流 → Run workflow
+#   2. 自动：push 修改 cgroupv2_freeze 源码或本 yml 时
+#
+# 产物：运行完成页底部 Artifacts 区下载
+#   - cgroupv2_freeze_1.0.12.kpm        release 版
+#   - cgroupv2_freeze_1.0.12_debug.kpm  debug 版（内核日志更详细，排查用）
+# ============================================================
+on:
+  push:
+    paths:
+      - ".github/workflows/build-cgroupv2-freeze.yml"
+      - "cgroupv2_freeze/**.c"
+      - "cgroupv2_freeze/**.h"
+      - "kpm_utils.h"
+  workflow_dispatch:
+    inputs:
+      build_debug:
+        description: "同时编译 debug 版"
+        required: false
+        default: true
+        type: boolean
+      apply_patch:
+        description: "应用 patches/ 目录下的 .patch 修复补丁（若有）"
+        required: false
+        default: true
+        type: boolean
+      build_module:
+        description: "要编译的模块目录名"
+        required: false
+        default: "cgroupv2_freeze"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+      # ---------- 1. 拉取源码（含 KernelPatch 子模块，编译 KPM 需要其内核头文件） ----------
+      - name: 拉取仓库源码与子模块
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive   # 拉取 KernelPatch 子模块
+          fetch-depth: 1
+
+      # ---------- 2. 安装编译工具链（KPM = clang 可重定位链接） ----------
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y llvm clang lld make file
+
+      # ---------- 3. 查看关键路径（便于排错） ----------
+      - name: 显示仓库结构
+        run: |
+          echo "=== 仓库顶层 ==="
+          ls -la
+          echo "=== KernelPatch 子模块 ==="
+          ls KernelPatch/ | head -5 || echo "!! KernelPatch 子模块为空 - 检查 submodule 拉取"
+          echo "=== 目标模块 ==="
+          ls -la ${{ inputs.build_module || 'cgroupv2_freeze' }}/ 2>/dev/null || echo "!! 模块目录不存在"
+
+      # ---------- 4. （可选）应用修复补丁 ----------
+      - name: 应用修复补丁（若存在 patches/ 且勾选）
+        if: ${{ inputs.apply_patch }}
+        run: |
+          if ls patches/*.patch >/dev/null 2>&1; then
+            for p in patches/*.patch; do
+              echo "应用补丁: $p"
+              git apply --verbose "$p" || patch -p1 < "$p" || echo "补丁应用失败(跳过): $p"
+            done
+          else
+            echo "未发现 patches/ 目录下的 .patch，跳过"
+          fi
+
+      # ---------- 5. 编译 KPM（release 版） ----------
+      - name: 编译模块 (release)
+        working-directory: ${{ inputs.build_module || 'cgroupv2_freeze' }}
+        run: |
+          make clean 2>/dev/null || true
+          make || { echo "::error::编译失败，请展开本步骤查看编译器报错"; exit 1; }
+          echo "--- 编译产物 ---"
+          ls -la *.kpm 2>/dev/null || echo "!! 未生成 .kpm"
+
+      # ---------- 6. 编译 debug 版（可选，排查/反馈作者用） ----------
+      - name: 编译模块 (debug 版)
+        if: ${{ inputs.build_debug }}
+        working-directory: ${{ inputs.build_module || 'cgroupv2_freeze' }}
+        run: |
+          make debug || { echo "::warning::debug 版编译失败（可忽略，release 版不受影响）"; }
+          ls -la *debug*.kpm 2>/dev/null || true
+
+      # ---------- 7. 集中产物 + 校验 ----------
+      - name: 收集并校验产物
+        run: |
+          mkdir -p target
+          cp ${{ inputs.build_module || 'cgroupv2_freeze' }}/*.kpm target/ 2>/dev/null || true
+          echo "=== 最终产物 ==="
+          ls -la target/
+          for f in target/*.kpm; do
+            [ -f "$f" ] && echo "$(basename "$f") | $(file -b "$f" | cut -c1-50) | sha256: $(sha256sum "$f" | cut -c1-16)"
+          done
+          if ! ls target/*.kpm >/dev/null 2>&1; then
+            echo "::error::没有任何 .kpm 产物生成"
+            exit 1
+          fi
+
+      # ---------- 8. 上传产物（Actions 页底部下载） ----------
+      - name: 上传产物 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kpm-build-output
+          path: target/
+          if-no-files-found: error
+
+      # ---------- 9.（可选）自动发布到 GitHub Release ----------
+      # 需要手动运行时填写 release_version 才触发；新手可先忽略
+      # - name: 发布 Release
+      #   if: inputs.release_version != ''
+      #   uses: ncipollo/release-action@v1
+      #   with:
+      #     token: ${{ secrets.GITHUB_TOKEN }}
+      #     tag: ${{ inputs.release_version }}
+      #     artifacts: "target/*.kpm"
+      #     allowUpdates: true
